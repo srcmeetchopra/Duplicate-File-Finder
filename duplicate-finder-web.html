@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Duplicate File Finder</title>
+<style>
+:root{
+  --bg:#f7f7f8; --card:#ffffff; --text:#1a1a1a; --muted:#6b6b70;
+  --accent:#3b6df0; --accent-text:#ffffff; --border:#e3e3e6; --ok:#1a8a4a; --danger:#d1453b;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#131316; --card:#1c1c20; --text:#eaeaec; --muted:#96969c;
+    --accent:#5c86ff; --accent-text:#0b0b0d; --border:#2c2c31; --ok:#3ddc84; --danger:#ff6b60;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#131316; --card:#1c1c20; --text:#eaeaec; --muted:#96969c;
+  --accent:#5c86ff; --accent-text:#0b0b0d; --border:#2c2c31; --ok:#3ddc84; --danger:#ff6b60;
+}
+html{scroll-padding-top:env(safe-area-inset-top,0px);}
+*{box-sizing:border-box;}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  min-height:100%;
+}
+.wrap{max-width:760px;margin:0 auto;padding:28px 18px 60px;}
+h1{font-size:1.4rem;margin:0 0 4px;}
+.sub{color:var(--muted);font-size:0.92rem;margin:0 0 20px;line-height:1.5;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:16px;}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+button{
+  font:inherit;border:1px solid var(--border);background:var(--card);color:var(--text);
+  padding:9px 16px;border-radius:8px;cursor:pointer;
+}
+button.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent);font-weight:600;}
+button.danger{background:var(--danger);color:#fff;border-color:var(--danger);}
+button:hover{filter:brightness(1.05);}
+progress{width:100%;height:8px;accent-color:var(--accent);margin-top:10px;}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-top:14px;}
+.stat b{display:block;font-size:1.25rem;}
+.stat span{color:var(--muted);font-size:0.8rem;}
+.group{border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:10px;overflow-x:auto;}
+.group h3{margin:0 0 8px;font-size:0.9rem;color:var(--muted);font-weight:600;}
+.fileRow{display:flex;align-items:flex-start;gap:8px;padding:5px 0;font-size:0.88rem;word-break:break-all;}
+.fileRow input{margin-top:3px;flex-shrink:0;}
+.fileRow.keep{color:var(--ok);}
+.small{font-size:0.8rem;color:var(--muted);}
+#results{margin-top:18px;}
+#log{white-space:pre-wrap;font-size:0.8rem;color:var(--muted);margin-top:8px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔍 Duplicate File Finder</h1>
+  <p class="sub">Runs entirely in your browser — nothing is uploaded. Pick a folder to scan for true content duplicates and, if your browser allows it, move them into a quarantine subfolder for you.</p>
+
+  <div class="card">
+    <div class="row">
+      <button class="primary" id="pickBtn">Choose Folder</button>
+    </div>
+    <p class="small" id="modeNote" style="margin-top:10px;"></p>
+    <progress id="progress" value="0" max="1" style="display:none;"></progress>
+    <div id="log"></div>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+const pickBtn = document.getElementById('pickBtn');
+const modeNote = document.getElementById('modeNote');
+const progressEl = document.getElementById('progress');
+const logEl = document.getElementById('log');
+const resultsEl = document.getElementById('results');
+
+const hasFSA = 'showDirectoryPicker' in window;
+let rootHandle = null;   // set only when we have write access (FSA mode)
+let canWrite = false;
+
+modeNote.textContent = hasFSA
+  ? 'Tap Choose Folder — you\'ll be asked to allow read & write access so duplicates can be moved for you.'
+  : 'Your browser can scan and report duplicates, but can\'t move files for you (Chrome/Edge desktop unlocks that). You\'ll get a list to review and delete manually.';
+
+function log(msg) { logEl.textContent = msg; }
+
+// Names/patterns to skip everywhere — OS metadata, version control, and build junk,
+// never actual user duplicates.
+const SKIP_NAMES = new Set([
+  '.ds_store', 'thumbs.db', 'desktop.ini', 'ehthumbs.db', '.spotlight-v100',
+  '.trashes', '.fseventsd', '.documentrevisions-v100', 'system volume information',
+  '$recycle.bin', '.git', '.svn', '.hg', 'node_modules', '__pycache__'
+]);
+
+function isSkippable(name) {
+  const lower = name.toLowerCase();
+  if (SKIP_NAMES.has(lower)) return true;
+  if (name.startsWith('.')) return true;   // hidden/dotfiles (.gitignore, .env, etc.)
+  if (name.startsWith('~$')) return true;  // Office lock files
+  return false;
+}
+
+pickBtn.addEventListener('click', async () => {
+  resultsEl.innerHTML = '';
+  rootHandle = null;
+  canWrite = false;
+  let entries = [];
+
+  if (hasFSA) {
+    try {
+      const root = await window.showDirectoryPicker({ mode: 'readwrite' });
+      const perm = await root.queryPermission({ mode: 'readwrite' }) === 'granted'
+        ? 'granted'
+        : await root.requestPermission({ mode: 'readwrite' });
+      rootHandle = root;
+      canWrite = perm === 'granted';
+      log(canWrite ? 'Write access granted. Reading folder…' : 'Read-only access — files can be listed but not moved.');
+      entries = await walkFSA(root, root.name);
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      log('Could not open folder: ' + err.message);
+      return;
+    }
+  } else {
+    entries = await pickViaInput();
+    if (!entries) return;
+  }
+
+  entries = entries.filter(e => !isSkippable(e.name));
+
+  if (entries.length === 0) {
+    log('No files found (after skipping system files).');
+    return;
+  }
+  await scan(entries);
+});
+
+function pickViaInput() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.webkitdirectory = true;
+    input.multiple = true;
+    input.onchange = (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) { resolve(null); return; }
+      resolve([...files].map(f => ({
+        name: f.name,
+        path: f.webkitRelativePath || f.name,
+        size: f.size,
+        getFile: async () => f,
+        remove: null
+      })));
+    };
+    input.click();
+  });
+}
+
+async function walkFSA(dirHandle, path, out = []) {
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (isSkippable(name)) continue;
+    const childPath = path + '/' + name;
+    if (handle.kind === 'file') {
+      const file = await handle.getFile();
+      out.push({
+        name,
+        path: childPath,
+        size: file.size,
+        getFile: async () => handle.getFile(),
+        remove: async () => dirHandle.removeEntry(name)
+      });
+    } else if (handle.kind === 'directory' && name !== 'duplicate-finder-quarantine') {
+      await walkFSA(handle, childPath, out);
+    }
+  }
+  return out;
+}
+
+async function hashFile(file) {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function scan(entries) {
+  pickBtn.disabled = true;
+  progressEl.style.display = 'block';
+  progressEl.max = entries.length;
+  progressEl.value = 0;
+  const start = performance.now();
+
+  const bySize = new Map();
+  for (const e of entries) {
+    if (!bySize.has(e.size)) bySize.set(e.size, []);
+    bySize.get(e.size).push(e);
+  }
+  const candidates = [...bySize.values()].filter(g => g.length > 1);
+
+  const byHash = new Map();
+  let done = 0;
+  for (const group of candidates) {
+    for (const e of group) {
+      try {
+        const file = await e.getFile();
+        const hash = await hashFile(file);
+        const key = e.size + ':' + hash;
+        if (!byHash.has(key)) byHash.set(key, []);
+        byHash.get(key).push(e);
+      } catch (err) {
+        log(`Skipped unreadable file: ${e.path}`);
+      }
+      done++;
+      progressEl.value = done;
+      if (done % 15 === 0) await new Promise(r => setTimeout(r, 0));
+    }
+  }
+  progressEl.value = entries.length;
+
+  const groups = [...byHash.values()].filter(g => g.length > 1)
+    .sort((a, b) => (b[0].size * (b.length - 1)) - (a[0].size * (a.length - 1)));
+
+  const seconds = ((performance.now() - start) / 1000).toFixed(2);
+  const dupFiles = groups.reduce((n, g) => n + g.length, 0);
+  const wasted = groups.reduce((n, g) => n + g[0].size * (g.length - 1), 0);
+
+  log(`Done in ${seconds}s.`);
+  pickBtn.disabled = false;
+  render(groups, { scanned: entries.length, groups: groups.length, dupFiles, wasted });
+}
+
+function fmtSize(n) {
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(2)) + ' ' + units[i];
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function render(groups, stats) {
+  let html = `<div class="card"><div class="stats">
+    <div class="stat"><b>${stats.scanned.toLocaleString()}</b><span>files scanned</span></div>
+    <div class="stat"><b>${stats.groups.toLocaleString()}</b><span>duplicate groups</span></div>
+    <div class="stat"><b>${stats.dupFiles.toLocaleString()}</b><span>duplicate files</span></div>
+    <div class="stat"><b>${fmtSize(stats.wasted)}</b><span>reclaimable</span></div>
+  </div></div>`;
+
+  if (groups.length === 0) {
+    resultsEl.innerHTML = html + '<p class="small">No duplicates found.</p>';
+    return;
+  }
+
+  html += `<div class="card row">
+    <button id="dlCsv">Download report (CSV)</button>
+    ${canWrite ? '<button id="quarantineBtn" class="danger">Move selected into quarantine folder</button>' : ''}
+    <span class="small">First file in each group is the suggested keeper; the rest are pre-checked.</span>
+  </div>`;
+
+  groups.forEach((group, gi) => {
+    html += `<div class="group"><h3>Group ${gi + 1} — ${fmtSize(group[0].size)} each</h3>`;
+    group.forEach((e, fi) => {
+      const keep = fi === 0;
+      html += `<div class="fileRow ${keep ? 'keep' : ''}">
+        <input type="checkbox" data-g="${gi}" data-f="${fi}" ${keep ? '' : 'checked'}>
+        <span>${keep ? '<b>KEEP</b> — ' : ''}${escapeHtml(e.path)}</span>
+      </div>`;
+    });
+    html += `</div>`;
+  });
+
+  resultsEl.innerHTML = html;
+  document.getElementById('dlCsv').addEventListener('click', () => downloadCsv(groups));
+  const qBtn = document.getElementById('quarantineBtn');
+  if (qBtn) qBtn.addEventListener('click', () => quarantineSelected(groups));
+}
+
+function downloadCsv(groups) {
+  let rows = [['group', 'path', 'size_bytes', 'suggested_action']];
+  groups.forEach((group, gi) => {
+    group.forEach((e, fi) => rows.push([gi + 1, e.path, e.size, fi === 0 ? 'keep' : 'delete']));
+  });
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'duplicate-report.csv';
+  a.click();
+}
+
+async function quarantineSelected(groups) {
+  const boxes = [...document.querySelectorAll('#results input[type=checkbox]:checked')];
+  if (boxes.length === 0) { alert('No files selected.'); return; }
+  if (!rootHandle) { alert('No folder handle available.'); return; }
+  if (!confirm(`Move ${boxes.length} file(s) into a "duplicate-finder-quarantine" subfolder?`)) return;
+
+  let quarantineDir;
+  try {
+    quarantineDir = await rootHandle.getDirectoryHandle('duplicate-finder-quarantine', { create: true });
+  } catch (err) {
+    alert('Could not create quarantine folder: ' + err.message);
+    return;
+  }
+
+  let moved = 0, failed = 0;
+  for (const box of boxes) {
+    const gi = +box.dataset.g, fi = +box.dataset.f;
+    const e = groups[gi][fi];
+    try {
+      const file = await e.getFile();
+      const safeName = `${Date.now()}_${gi}_${fi}_${e.name}`;
+      const destHandle = await quarantineDir.getFileHandle(safeName, { create: true });
+      const writable = await destHandle.createWritable();
+      await writable.write(await file.arrayBuffer());
+      await writable.close();
+      await e.remove();
+      moved++;
+      box.closest('.fileRow').style.opacity = '0.4';
+      box.disabled = true;
+    } catch (err) {
+      failed++;
+      log(`Failed to move ${e.path}: ${err.message}`);
+    }
+  }
+  alert(failed === 0
+    ? `Moved ${moved} file(s) into duplicate-finder-quarantine.`
+    : `Moved ${moved} file(s); ${failed} failed (see status text below the button).`);
+}
+</script>
+</body>
+</html>
